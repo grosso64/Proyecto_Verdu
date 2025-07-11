@@ -1,115 +1,243 @@
-const express = require("express");
-const sqlite3 = require("sqlite3").verbose();
-const cors = require("cors");
+const config = require('./config');
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 const app = express();
 
-app.use(cors());
+// =============================================
+// Configuración del Servidor
+// =============================================
+const PORT = config.PORT || 5000;
+
+// =============================================
+// Configuración de la Base de Datos
+// =============================================
+const db = new sqlite3.Database(config.DATABASE_PATH, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
+  if (err) {
+    console.error('❌ Error al conectar con SQLite:', err.message);
+    process.exit(1); // Salir si no hay conexión a DB
+  } else {
+    console.log('🟢 Conectado a SQLite');
+    initializeDatabase();
+  }
+});
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Conectar base de datos
-const db = new sqlite3.Database("./db/database.sqlite", (err) => {
-  if (err) return console.error("❌ Error al conectar:", err.message);
-  console.log("🟢 Base de datos conectada");
-});
-
-// Crear tablas
-db.serialize(() => {
-  // Tabla usuarios
-  db.run(`
-    CREATE TABLE IF NOT EXISTS usuarios (
+// Función de inicialización de la base de datos
+function initializeDatabase() {
+  db.serialize(() => {
+    // 1. Crear tabla principal de pedidos
+    db.run(`CREATE TABLE IF NOT EXISTS pedidos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      nombre TEXT NOT NULL,
-      clave TEXT NOT NULL
-    )
-  `);
+      cliente TEXT NOT NULL,
+      pedido TEXT NOT NULL,
+      faltantes TEXT,
+      procesado BOOLEAN DEFAULT 0,
+      fecha DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`, (err) => {
+      if (err) console.error('❌ Error al crear tabla pedidos:', err.message);
+    });
 
-  // Usuario por defecto
-  db.get("SELECT COUNT(*) as total FROM usuarios", (err, row) => {
-    if (row.total === 0) {
-      db.run("INSERT INTO usuarios (nombre, clave) VALUES (?, ?)", ["admin", "1234"]);
-      console.log("🧑‍💼 Usuario admin creado");
-    }
+    // 2. Verificar estructura de la tabla
+    db.all("PRAGMA table_info(pedidos)", [], (err, columns) => {
+      if (err) return console.error('❌ Error al verificar tabla:', err.message);
+      
+      const requiredColumns = {
+        cliente: 'TEXT NOT NULL',
+        pedido: 'TEXT NOT NULL',
+        faltantes: 'TEXT',
+        procesado: 'BOOLEAN DEFAULT 0'
+      };
+
+      // Verificar y agregar columnas faltantes
+      Object.entries(requiredColumns).forEach(([col, type]) => {
+        if (!columns.some(c => c.name === col)) {
+          db.run(`ALTER TABLE pedidos ADD COLUMN ${col} ${type}`, (err) => {
+            if (err) console.error(`❌ Error al añadir ${col}:`, err.message);
+            else console.log(`✅ Columna '${col}' añadida correctamente`);
+          });
+        }
+      });
+    });
   });
-
-  // Tabla productos
-  db.run(`
-    CREATE TABLE IF NOT EXISTS productos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      nombre TEXT NOT NULL,
-      unidad TEXT NOT NULL,
-      stock REAL NOT NULL
-    )
-  `);
-
-  // Tabla pedidos
-  db.run(`
-    CREATE TABLE IF NOT EXISTS pedidos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      texto_original TEXT NOT NULL,
-      fecha TEXT NOT NULL,
-      total_faltantes TEXT
-    )
-  `);
+}
+// Después de conectar a la DB:
+db.serialize(() => {
+  // Lista de cambios necesarios
+  const cambios = [
+    "ALTER TABLE pedidos ADD COLUMN prioridad INTEGER DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS clientes (id INTEGER PRIMARY KEY, telefono TEXT UNIQUE)"
+  ];
+  
+  cambios.forEach(sql => {
+    db.run(sql, err => {
+      if (err && !err.message.includes('duplicate column')) { // Ignora errores de columna ya existente
+        console.error(`❌ Error aplicando cambio: ${sql}`, err.message);
+      }
+    });
+  });
 });
-//gets productos
-app.get("/productos", (req, res) => {
-  db.all("SELECT * FROM productos", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+// =============================================
+// Middlewares
+// =============================================
+app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// =============================================
+// Webhook de WhatsApp (Solo Recepción)
+// =============================================
+
+// 1. Endpoint de verificación (GET)
+app.get('/webhook', (req, res) => {
+  console.log('🔍 Parámetros recibidos:', req.query);
+  
+  if (req.query['hub.verify_token'] === process.env.VERIFY_TOKEN) {
+    console.log('✅ Webhook verificado');
+    return res.status(200).send(req.query['hub.challenge']);
+  }
+  
+  console.log('❌ Token incorrecto');
+  res.sendStatus(403);
+});
+
+// 2. Endpoint para recibir mensajes (POST)
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('📩 Datos recibidos:', JSON.stringify(req.body, null, 2));
+    
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const message = change?.value?.messages?.[0];
+    
+    // Solo procesar mensajes de texto
+    if (message?.type === 'text') {
+      const { from, text } = message;
+      
+      // Extraer productos del mensaje
+      const productos = extraerProductos(text.body);
+      
+      // Consultar stock en la base de datos
+      const faltantes = await verificarStock(productos);
+      
+      // Guardar en base de datos (sin enviar respuesta)
+      await guardarPedido(from, text.body, faltantes);
+      
+      console.log('📥 Pedido registrado:', {
+        cliente: from,
+        productos: productos.length,
+        faltantes: faltantes.length
+      });
+    }
+    
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('🔥 Error en webhook:', error);
+    res.sendStatus(500);
+  }
+});
+
+// =============================================
+// Funciones auxiliares (SIN ENVÍO DE MENSAJES)
+// =============================================
+
+function extraerProductos(texto) {
+  return texto.split(',')
+    .map(item => {
+      const match = item.trim().match(/(\d+)\s*(kg|unidades?)?\s*(?:de\s+)?([a-záéíóúñ\s]+)/i);
+      return match && {
+        cantidad: parseFloat(match[1]),
+        unidad: match[2] || 'unidad',
+        nombre: match[3].trim().toLowerCase()
+      };
+    })
+    .filter(Boolean);
+}
+
+async function verificarStock(productos) {
+  const faltantes = [];
+  
+  for (const producto of productos) {
+    const enStock = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT stock, unidad FROM productos WHERE nombre LIKE ?',
+        [`%${producto.nombre}%`],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        }
+      );
+    });
+    
+    if (!enStock) {
+      faltantes.push({
+        ...producto,
+        motivo: 'Producto no registrado'
+      });
+    } else if (enStock.stock < producto.cantidad) {
+      faltantes.push({
+        nombre: producto.nombre,
+        faltan: producto.cantidad - enStock.stock,
+        unidad: enStock.unidad,
+        motivo: 'Stock insuficiente'
+      });
+    }
+  }
+  
+  return faltantes;
+}
+
+function guardarPedido(cliente, pedido, faltantes) {
+  return new Promise((resolve, reject) => {
+    db.run(
+      'INSERT INTO pedidos (cliente, pedido, faltantes) VALUES (?, ?, ?)',
+      [cliente, pedido, JSON.stringify(faltantes)],
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
+}
+
+// =============================================
+// Endpoints de Administración
+// =============================================
+
+app.get('/admin/pedidos', (req, res) => {
+  db.all('SELECT * FROM pedidos ORDER BY fecha DESC', [], (err, rows) => {
+    if (err) {
+      console.error('❌ Error al obtener pedidos:', err.message);
+      return res.status(500).json({ error: 'Error en la base de datos' });
+    }
     res.json(rows);
   });
 });
-//post productos
-app.post("/productos", (req, res) => {
-  const { nombre, unidad, stock } = req.body;
 
-  if (!nombre || !unidad || stock == null) {
-    return res.status(400).json({ error: "Faltan datos" });
-  }
-
+app.put('/admin/pedidos/:id', (req, res) => {
   db.run(
-    "INSERT INTO productos (nombre, unidad, stock) VALUES (?, ?, ?)",
-    [nombre, unidad, stock],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ id: this.lastID });
-    }
-  );
-});
-//put productos
-app.put("/productos/:id", (req, res) => {
-  const id = req.params.id;
-  const { stock } = req.body;
-
-  db.run(
-    "UPDATE productos SET stock = ? WHERE id = ?",
-    [stock, id],
-    function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      if (this.changes === 0) {
-        return res.status(404).json({ error: "Producto no encontrado" });
+    'UPDATE pedidos SET procesado = ? WHERE id = ?',
+    [req.body.procesado ? 1 : 0, req.params.id],
+    function(err) {
+      if (err) {
+        console.error('❌ Error al actualizar pedido:', err.message);
+        return res.status(500).json({ error: 'Error en la base de datos' });
       }
-      res.json({ mensaje: "Stock actualizado" });
+      res.sendStatus(200);
     }
   );
 });
-//post login
-app.post("/login", (req, res) => {
-  const { nombre, clave } = req.body;
 
-  db.get(
-    "SELECT * FROM usuarios WHERE nombre = ? AND clave = ?",
-    [nombre, clave],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: err.message });
-      if (row) {
-        res.json({ acceso: true });
-      } else {
-        res.json({ acceso: false });
-      }
-    }
-  );
-});
-// Servidor
-app.listen(5000, () => {
-  console.log("🚀 Backend corriendo en http://localhost:5000");
+// =============================================
+// Iniciar el servidor
+// =============================================
+app.listen(PORT, () => {
+  console.log(`\n🚀 Servidor funcionando en http://localhost:${PORT}`);
+  console.log('🔧 Configuración:');
+  console.log(`- Puerto: ${PORT}`);
+  console.log(`- Ruta DB: ${config.DATABASE_PATH}`);
+  console.log(`- Modo: ${config.NODE_ENV || 'development'}\n`);
 });

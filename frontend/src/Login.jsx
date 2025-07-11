@@ -4,15 +4,32 @@ import "./Login.css";
 function Login({ onLogin }) {
   const [usuario, setUsuario] = useState("");
   const [clave, setClave] = useState("");
+  const [cargando, setCargando] = useState(false);
 
-  const manejarEnvio = (e) => {
+  const manejarEnvio = async (e) => {
     e.preventDefault();
+    setCargando(true);
 
-    if (usuario === "admin" && clave === "1234") {
-      onLogin(); // llama a una función que activa el acceso
-    } else {
-      alert("Usuario o contraseña incorrectos");
+    try {
+      const respuesta = await fetch("http://localhost:5000/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nombre: usuario, clave }),
+      });
+
+      const data = await respuesta.json();
+
+      if (data.acceso) {
+        onLogin();
+      } else {
+        alert("Usuario o contraseña incorrectos");
+      }
+    } catch (error) {
+      alert("Error al conectar con el servidor");
+      console.error(error);
     }
+
+    setCargando(false);
   };
 
   return (
@@ -33,7 +50,9 @@ function Login({ onLogin }) {
           onChange={(e) => setClave(e.target.value)}
           required
         />
-        <button type="submit">Ingresar</button>
+        <button type="submit" disabled={cargando}>
+          {cargando ? "Ingresando..." : "Ingresar"}
+        </button>
       </form>
     </div>
   );
